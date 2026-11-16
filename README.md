@@ -16,9 +16,23 @@ python3 -m facetproof --root ./facet-data --host 127.0.0.1 --port 8796
 python3 -m facetproof.demo --flow render-plates --output ./preview
 ```
 
-演示使用临时数据库，不影响服务数据。其他流程名见 `facetproof/demo.py` 的 `FLOWS`。输入按顺序为：创建 `/facet/v1/meshes` 和 `/pigments`，创建 `/assemblies`，以版本号更新布置，再调用 `/assemblies/{id}/seal`；对 `/seals/{id}/exposures` 提交带唯一 `key` 的请求，然后执行 worker。图版的 `/passes/color.png`、`depth.png`、`object.png` 可供查看；`/pick?x=...&y=...` 返回物体及摄像机前向距离。`/verify` 校验文件，`/bundle` 导出包含快照及全部通道的 ZIP。
+演示使用临时数据库，不影响服务数据。其他流程名见 `facetproof/demo.py` 的 `FLOWS`（含 `lens-calibration`、`valid-framing`、`mapping-rejection`、`mapping-preview` 四个标定流程）。输入按顺序为：创建 `/facet/v1/meshes` 和 `/pigments`，创建 `/assemblies`，以版本号更新布置，再调用 `/assemblies/{id}/seal`；对 `/seals/{id}/exposures` 提交带唯一 `key` 的请求，然后执行 worker。图版的 `/passes/color.png`、`depth.png`、`object.png` 可供查看；`/pick?x=...&y=...` 返回物体及摄像机前向距离，并以 `valid_source` 标明该像素是否有唯一成像来源。`/verify` 校验文件，`/bundle` 导出包含快照及全部通道的 ZIP。
 
 坐标使用右手空间，镜头支持透视和正交投影，旋转以度为单位；颜色输入为 0–1 sRGB，内部以线性光计算。每个图版包含 RGB、32 位浮点深度、32 位无符号物体编号和对应 PNG；背景深度为正无穷。图版保留颜色与深度的输入快照和摘要。服务有图像尺寸、采样、面数和渲染时间上限。
+
+## 镜头标定：偏移主点与径向畸变
+
+镜头可声明 `principal_point: [px, py]`（等效半高为 1 的归一化单位，±4 内）、`distortion: {"k1","k2","k3"}`（径向多项式，k1 ∈ ±4，k2/k3 ∈ ±8）和 `framing: "full" | "valid"`，用于把零件图与实拍照片对齐。未声明或全零的镜头保持原有对称透视/正交行为，输出字节不变。
+
+畸变映射 `rd(r) = r·(1 + k1 r² + k2 r⁴ + k3 r⁶)` 只在单调递增且比例为正时单射。服务从冻结镜头确定性地求出**有效成像范围**（以主点为圆心的圆盘半径），并在图版 `mapping` 报告中公布：圆心、半径、取景矩形、实际容差。圆盘之外的像素没有唯一来源方向，一律写入保留身份 `0xFFFFFFFF`、正无穷深度和保留填充色（品红），不计入 `covered_pixels`——填补边缘不会被伪称为真实表面。`GET /plates/{id}/pick` 对这类像素返回 `valid_source: false` 和 `reason: "outside_valid_imaging_range"`，不会凭求解偶然落点报出零件。
+
+取景范围由用户明确选择：`framing: "full"` 保留请求的全部画布，无效边缘按上法标记；`framing: "valid"` 把图版裁到有效圆盘的包围盒（不小于 16×16），牺牲圆盘外的零件换取全部像素有效。有效画质由曝光请求的 `mapping_tolerance`（0.1–8，最终像素单位，默认 0.5）声明：它限制三角剖分逼近曲线畸变的最大误差。取景选择随镜头冻结进快照，画质随请求冻结进曝光，两者都进入图版 `mapping` 报告与分块指纹，重渲只能复用完全相同的定义。
+
+有效范围为空（例如强畸变加偏心使圆盘落在画布外，或不足 16 像素）的曝光在提交时以 `valid_range` 拒绝并说明原因。局部难解映射不会让工作量失去上界：剖分深度封顶、计划三角形总数封顶 240000，超出时曝光以 `mapping_budget` 失败并提示提高容差或缩小画布，不会偷偷缩小有效范围或减弱畸变。每次尝试仍有 45 秒渲染预算。
+
+`POST /facet/v1/assemblies/{id}/preview` 在编辑标定时同步预览当前草稿（宽/高 ≤ 192，单采样，15 秒预算）：返回 base64 颜色图、`mapping` 报告和实际采用的 `mapping_tolerance` 与三角形数。预览不写曝光、图版或额度，响应标记 `approximate: true`；正式曝光各自记录并冻结自己的画质，二者可由报告区分。
+
+标定镜头的图版使用 `facet-plate-2` 格式并携带 `mapping` 报告；传统镜头仍是 `facet-plate-1`。图版比较要求两侧 `mapping` 完全一致（焦距、畸变、取景与画质均相同），否则以 `alignment` 拒绝，并额外报告 `invalid_changed`。独立读取器核验 `facet-plate-2` 时会从冻结镜头与请求重新推导有效半径、圆心和取景矩形，与图版声明不符即拒绝。
 
 曝光现在按高采样画布的 64×64 块保存计算进度。`GET /facet/v1/exposures/{id}/progress` 返回已经提交的块和像素数。块完成不等于图版成功：只有所有块完整、内容可读、租约仍有效且未取消，才会生成最终图版。进程中断后，先恢复过期租约，再执行工作器即可复用同一冻结输入的已提交块；显式重试失败曝光也复用完整块。渲染仍有每次尝试 45 秒预算，服务不会自动启动后台工作器。
 
@@ -30,7 +44,7 @@ python3 -m facetproof.demo --flow render-plates --output ./preview
 python3 -m facetreader ./plate-bundle.zip --output ./received-plate
 ```
 
-独立读取器不导入渲染服务代码，自行检查 ZIP、PNG、原始通道和冻结来源；有效时退出 0，拒绝时退出 2。它限制输入和解压体积，只接受当前两份元数据及六个通道。核验通过表示包内事实一致，不能证明外部来源真实，也不能证明服务中当前审阅意见仍有效。输出目录提供颜色图、来源报告和拾取样例。
+独立读取器不导入渲染服务代码，自行检查 ZIP、PNG、原始通道和冻结来源；有效时退出 0，拒绝时退出 2。它限制输入和解压体积，只接受当前两份元数据及六个通道，核验 `facet-plate-1` 与 `facet-plate-2`；对标定图版会重新推导镜头映射并与声明比对。核验通过表示包内事实一致，不能证明外部来源真实，也不能证明服务中当前审阅意见仍有效。输出目录提供颜色图、来源报告和拾取样例。
 
 完整在线备份分为固定快照和续做复制两步：`POST /facet/v1/maintenance/backups` 返回操作标识；`POST /facet/v1/maintenance/backups/{id}/resume` 复制并核对该快照引用的最终通道及在途分块。可以在中断后对同一操作续做，不会重新抓取另一个 SQL 时点。`GET /facet/v1/maintenance/backups/{id}` 查询状态，末尾追加 `/verify` 独立复核完成后的备份。缺失或损坏的来源内容会明确失败。备份位于数据根的 `backups/{id}/data`；恢复演练应先复制这份目录到新的数据根，再启动服务，避免改写备份本身。SQL 中的维护控制行属于备份时的历史记录，不能在另一数据根继续原机器的操作。
 

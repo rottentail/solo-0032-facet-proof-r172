@@ -44,6 +44,7 @@ def route_request(app, method, target, data=None):
         if method == "POST" and group == "meshes" and action == "retire": return app.meshes.retire(ident, data.get("revision"))
         if method == "POST" and group == "assemblies" and action == "seal": return app.seals.create(ident, data.get("revision"))
         if method == "POST" and group == "assemblies" and action == "fork": return app.assemblies.fork(ident, data.get("name"))
+        if method == "POST" and group == "assemblies" and action == "preview": return app.previews.create(ident, data)
         if method == "POST" and group == "seals" and action == "exposures": return app.exposures.submit(ident, data)
         if method == "POST" and group == "exposures" and action == "cancel": return app.exposures.cancel(ident)
         if method == "POST" and group == "exposures" and action == "retry": return app.exposures.retry(ident)

@@ -2,6 +2,7 @@ import json
 import math
 import struct
 from .errors import require
+from .mapping import INVALID_ID
 from .png import inspect_png
 from .values import identity, canonical, now, integer
 
@@ -54,6 +55,12 @@ class Plates:
     def verify_payload(self, payload):
         results = {}
         width, height = payload["width"], payload["height"]
+        mapping = payload.get("mapping")
+        if mapping is not None:
+            frame = mapping.get("frame", {})
+            require(payload.get("format") == "facet-plate-2" and
+                    frame.get("width") == width and frame.get("height") == height,
+                    "mapping", "Plate mapping frame disagrees with the plate extent", 409)
         for name, descriptor in payload["passes"].items():
             data = self.blobs.read(descriptor["sha256"])
             require(len(data) == descriptor["size"], "size", "Plate pass size mismatch", 409)
@@ -75,9 +82,14 @@ class Plates:
             offset = (y*payload["width"]+x) * 4
             index = struct.unpack_from("<I", self.blobs.read(payload["passes"]["object.u32"]["sha256"]), offset)[0]
             distance = struct.unpack_from("<f", self.blobs.read(payload["passes"]["depth.f32"]["sha256"]), offset)[0]
-            return {"x": x, "y": y, "object": payload["objects"].get(str(index)),
-                    "depth": distance if math.isfinite(distance) else None,
-                    "seal_id": payload["seal_id"]}
+            result = {"x": x, "y": y, "object": payload["objects"].get(str(index)),
+                      "depth": distance if math.isfinite(distance) else None,
+                      "seal_id": payload["seal_id"], "valid_source": index != INVALID_ID}
+            if index == INVALID_ID:
+                # The calibrated mapping has no unique source direction here;
+                # naming a part would be an accident of the solver, not a fact.
+                result["reason"] = "outside_valid_imaging_range"
+            return result
 
     def quarantine(self, plate_id, reason):
         from .values import text

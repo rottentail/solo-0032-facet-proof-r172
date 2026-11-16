@@ -2,6 +2,9 @@
 
 Tile channels precede downsampling: depth is IEEE f64, linear color is f32,
 and object identity is u32, all little endian. A tile is never a final plate.
+Format facet-tile-2 reserves object identity 0xFFFFFFFF for pixels outside
+the valid imaging range of a calibrated lens; such pixels keep
+positive-infinite depth and never name a real surface.
 """
 from array import array
 import math
@@ -9,10 +12,11 @@ import re
 import sys
 
 from .errors import require
+from .mapping import INVALID_ID
 from .values import digest, integer
 
-TILE_FORMAT = "facet-tile-1"
-TILE_RENDERER = "facet-window-raster-1"
+TILE_FORMAT = "facet-tile-2"
+TILE_RENDERER = "facet-window-raster-2"
 CHANNELS = {"depth.f64": ("d", 8, 1), "color.f32": ("f", 4, 3),
             "object.u32": ("I", 4, 1)}
 
@@ -27,8 +31,8 @@ def grid(width, height, edge=64):
 
 def fingerprint(exposure, plan, seal_hash, edge):
     request = exposure["request"]
-    require(plan["width"] == request["width"] * request["samples"] and
-            plan["height"] == request["height"] * request["samples"],
+    require(plan["width"] == plan["frame"]["width"] * request["samples"] and
+            plan["height"] == plan["frame"]["height"] * request["samples"],
             "tile_extent", "Render plan does not match the exposure", 409)
     return digest({"format": TILE_FORMAT, "tile_renderer": TILE_RENDERER,
                    "seal_id": exposure["seal_id"], "seal_hash": seal_hash,
@@ -89,10 +93,10 @@ def _samples(depth, colors, ids, pixels, objects=None):
     require(len(depth) == pixels and len(ids) == pixels and len(colors) == pixels * 3,
             "tile_extent", "Tile channel extent mismatch", 409)
     for distance, object_id in zip(depth, ids):
-        require((math.isfinite(distance) and distance > 0 and object_id != 0) or
-                (distance == math.inf and object_id == 0),
+        require((math.isfinite(distance) and distance > 0 and 0 < object_id < INVALID_ID) or
+                (distance == math.inf and object_id in (0, INVALID_ID)),
                 "tile_semantics", "Tile depth and background identity disagree", 409)
-        if object_id and objects is not None:
+        if object_id not in (0, INVALID_ID) and objects is not None:
             require(str(object_id) in objects, "tile_semantics", "Tile object is absent from the frozen mapping", 409)
     require(all(math.isfinite(value) for value in colors),
             "tile_semantics", "Tile color contains nonfinite samples", 409)

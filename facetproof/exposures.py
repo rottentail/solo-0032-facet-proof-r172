@@ -1,5 +1,7 @@
 import json
+from .camera import mapping_active
 from .errors import require
+from .mapping import analyze
 from .planner import validate_request
 from .values import identity, key, digest, canonical, now
 
@@ -29,7 +31,12 @@ class Exposures:
         dedup_key = key(data.get("key"), "key")
         request_hash = digest({"seal_id": seal_id, "request": request})
         with self.db.unit_of_work() as conn:
-            self.db.get(conn, seal_id, "seal")
+            seal = self.db.get(conn, seal_id, "seal")
+            lens = seal["payload"]["lens"]
+            if mapping_active(lens):
+                # Reject impossible calibrations before reserving capacity;
+                # the worker re-derives the same mapping deterministically.
+                analyze(lens, request["width"], request["height"], request["mapping_tolerance"])
             old = conn.execute("SELECT id,request_hash FROM exposures WHERE dedup_key=?", (dedup_key,)).fetchone()
             if old:
                 require(old["request_hash"] == request_hash, "key_conflict", "Key already names a different exposure", 409)

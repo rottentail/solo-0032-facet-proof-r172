@@ -1,10 +1,28 @@
 from array import array
 import math
-from .values import scalar
+from .mapping import INVALID_FILL_LINEAR, INVALID_ID
 
 
 def edge(a, b, x, y):
     return (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0])
+
+
+def _row_spans(mask, x0, x1, y0, y1):
+    """Per-row valid pixel spans of the imaging disk, in canvas coordinates."""
+    cx, cy = mask["center"]
+    radius = mask["radius"]
+    spans = []
+    for y in range(y0, y1):
+        dy = y + .5 - cy
+        remain = radius * radius - dy * dy
+        if remain <= 0:
+            spans.append(None)
+            continue
+        half = math.sqrt(remain)
+        low = max(x0, int(math.floor(cx - half - .5)) + 1)
+        high = min(x1 - 1, int(math.ceil(cx + half - .5)) - 1)
+        spans.append((low, high) if low <= high else None)
+    return spans
 
 
 def rasterize(plan, checkpoint, window=None):
@@ -17,9 +35,26 @@ def rasterize(plan, checkpoint, window=None):
     depth = array("d", [math.inf]) * length
     ids = array("I", [0]) * length
     colors = array("f", [0.]) * (length * 3)
-    for pixel in range(length):
-        for channel in range(3):
-            colors[pixel * 3 + channel] = plan["background"][channel]
+    mask = plan.get("valid_mask")
+    spans = _row_spans(mask, x0, x1, y0, y1) if mask is not None else None
+    if spans is None:
+        for pixel in range(length):
+            for channel in range(3):
+                colors[pixel * 3 + channel] = plan["background"][channel]
+    else:
+        # Pixels outside the valid imaging disk get the reserved invalid
+        # identity and fill; geometry is never allowed to cover them.
+        for row in range(height):
+            span = spans[row]
+            for col in range(width):
+                offset = row * width + col
+                if span is not None and span[0] <= x0 + col <= span[1]:
+                    for channel in range(3):
+                        colors[offset * 3 + channel] = plan["background"][channel]
+                else:
+                    ids[offset] = INVALID_ID
+                    for channel in range(3):
+                        colors[offset * 3 + channel] = INVALID_FILL_LINEAR[channel]
     fragments = 0
     for index, triangle in enumerate(plan["triangles"]):
         checkpoint()
@@ -34,7 +69,15 @@ def rasterize(plan, checkpoint, window=None):
         for y in range(top, bottom + 1):
             if y % 32 == 0:
                 checkpoint()
-            for x in range(left, right + 1):
+            row_left, row_right = left, right
+            if spans is not None:
+                span = spans[y - y0]
+                if span is None:
+                    continue
+                row_left, row_right = max(left, span[0]), min(right, span[1])
+                if row_left > row_right:
+                    continue
+            for x in range(row_left, row_right + 1):
                 wa = edge(b, c, x + .5, y + .5) / area
                 wb = edge(c, a, x + .5, y + .5) / area
                 wc = 1 - wa - wb

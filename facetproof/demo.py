@@ -1,4 +1,5 @@
 import argparse
+import base64
 import json
 from pathlib import Path
 import tempfile
@@ -7,7 +8,128 @@ from .application import Application
 from .errors import Fault, require
 from .routing import route_request, PREFIX
 
-FLOWS = ["mesh-intake", "mesh-retirement", "assembly-edit", "lens-edit", "seal-closure", "exposure-submit", "render-plates", "cancel-exposure", "retry-exposure", "verify-plate", "pixel-pick", "compare-plates", "proof-decision", "quarantine-plate", "recover-lease", "export-bundle", "reserve-capacity", "settle-capacity", "resize-capacity", "tile-progress", "offline-inspect", "backup-closure", "content-inspection"]
+FLOWS = ["mesh-intake", "mesh-retirement", "assembly-edit", "lens-edit", "seal-closure", "exposure-submit", "render-plates", "cancel-exposure", "retry-exposure", "verify-plate", "pixel-pick", "compare-plates", "proof-decision", "quarantine-plate", "recover-lease", "export-bundle", "reserve-capacity", "settle-capacity", "resize-capacity", "tile-progress", "offline-inspect", "backup-closure", "content-inspection", "lens-calibration", "valid-framing", "mapping-rejection", "mapping-preview"]
+
+def _calibrated_scene(call, lens):
+    mesh = call("POST", "meshes", {"name":"标定翼", "vertices":[[-1,-1,0],[1,-1,0],[1,1,0],[-1,1,0],[0,0,1.2]],
+                                   "faces":[[0,1,4],[1,2,4],[2,3,4],[3,0,4],[0,3,2],[0,2,1]]})
+    pigment = call("POST", "pigments", {"name":"釉青", "color":[.12,.62,.61], "two_sided":True})
+    assembly = call("POST", "assemblies", {"name":"标定说明图", "lens":lens})
+    assembly = call("PUT", "assemblies/"+assembly["id"], {"revision":1, "placements":[{"key":"wing", "mesh_id":mesh["id"], "pigment_id":pigment["id"], "transform":{"euler":[0,20,0]}}]})
+    return assembly
+
+
+def _grid_mesh(call, n=40):
+    vertices = [[-1.5 + 3*i/n, -1.5 + 3*j/n, 0] for j in range(n+1) for i in range(n+1)]
+    faces = []
+    for j in range(n):
+        for i in range(n):
+            a = j*(n+1)+i
+            faces.append([a, a+1, a+(n+2)])
+            faces.append([a, a+(n+2), a+(n+1)])
+    return call("POST", "meshes", {"name":"标定网格", "vertices":vertices, "faces":faces})
+
+
+def _commission_mapping(app, call, rejected, flow, output):
+    result = {"workflow": flow}
+    if flow == "mapping-preview":
+        assembly = _calibrated_scene(call, {"eye":[3,2,4], "principal_point":[0.35,-0.15],
+                                            "distortion":{"k1":-0.9,"k2":0.15}})
+        coarse = call("POST", "assemblies/"+assembly["id"]+"/preview",
+                      {"width":96, "height":96, "mapping_tolerance":2})
+        require(coarse["format"] == "facet-preview-1" and coarse["approximate"]
+                and coarse["mapping"]["tolerance"] == 2 and coarse["statistics"]["invalid_pixels"] > 0,
+                "commission", "Preview does not declare its approximate mapping", 500)
+        fine = call("POST", "assemblies/"+assembly["id"]+"/preview",
+                    {"width":96, "height":96, "mapping_tolerance":0.5})
+        require(fine["statistics"]["triangles"] > coarse["statistics"]["triangles"],
+                "commission", "Declared preview quality does not change the mapping", 500)
+        from .png import inspect_png
+        png = inspect_png(base64.b64decode(coarse["png_base64"]))
+        require(png["width"] == 96 and png["height"] == 96, "commission", "Preview image extent mismatch", 500)
+        require(call("GET", "resources")["reserved"] == 0 and not app.exposures.list(),
+                "commission", "Preview reserved capacity or created exposures", 500)
+        impossible = _calibrated_scene(call, {"eye":[3,2,4], "principal_point":[3.5,0], "distortion":{"k1":-4}})
+        result["rejected"] = rejected("POST", "assemblies/"+impossible["id"]+"/preview", {}, "valid_range")
+        result["preview"] = {"tolerance": coarse["mapping"]["tolerance"],
+                             "triangles": coarse["statistics"]["triangles"],
+                             "invalid_pixels": coarse["statistics"]["invalid_pixels"],
+                             "approximate": coarse["approximate"]}
+        return result
+    if flow == "mapping-rejection":
+        assembly = _calibrated_scene(call, {"eye":[3,2,4], "principal_point":[3.5,0], "distortion":{"k1":-4}})
+        seal = call("POST", "assemblies/"+assembly["id"]+"/seal", {"revision":2})
+        result["rejected"] = rejected("POST", "seals/"+seal["id"]+"/exposures",
+                                      {"key":"impossible", "width":96, "height":96}, "valid_range")
+        mesh = _grid_mesh(call)
+        pigment = call("POST", "pigments", {"name":"釉青", "color":[.12,.62,.61], "two_sided":True})
+        dense = call("POST", "assemblies", {"name":"预算说明图", "lens":{"eye":[0,0,4], "distortion":{"k1":-4,"k2":8,"k3":8}}})
+        dense = call("PUT", "assemblies/"+dense["id"], {"revision":1, "placements":[{"key":"grid", "mesh_id":mesh["id"], "pigment_id":pigment["id"]}]})
+        dense_seal = call("POST", "assemblies/"+dense["id"]+"/seal", {"revision":2})
+        exposure = call("POST", "seals/"+dense_seal["id"]+"/exposures",
+                        {"key":"budget", "width":256, "height":256, "samples":2, "mapping_tolerance":0.1})
+        rendered = call("POST", "worker/step")
+        require(rendered["state"] == "failed" and rendered["error"]["error"] == "mapping_budget",
+                "commission", "Runaway mapping was not bounded", 500)
+        require(call("GET", "exposures/"+exposure["id"])["state"] == "failed",
+                "commission", "Bounded failure did not settle", 500)
+        result["budget"] = rendered["error"]
+        return result
+    framing = "valid" if flow == "valid-framing" else "full"
+    assembly = _calibrated_scene(call, {"eye":[3,2,4], "principal_point":[0.35,-0.15],
+                                        "distortion":{"k1":-0.9,"k2":0.15}, "framing":framing})
+    seal = call("POST", "assemblies/"+assembly["id"]+"/seal", {"revision":2})
+    request = {"key":"calibrated", "width":96, "height":96, "samples":2}
+    call("POST", "seals/"+seal["id"]+"/exposures", request)
+    rendered = call("POST", "worker/step")
+    require(rendered["state"] == "succeeded", "commission", str(rendered), 500)
+    plate = rendered["plate"]
+    payload = plate["payload"]
+    mapping = payload["mapping"]
+    statistics = payload["statistics"]
+    require(payload["format"] == "facet-plate-2" and mapping["framing"] == framing and mapping["folded"],
+            "commission", "Plate does not record its calibrated mapping", 500)
+    require(statistics["invalid_pixels"] > 0 and statistics["covered_pixels"] > 0,
+            "commission", "Calibrated plate lacks both valid and invalid content", 500)
+    require((payload["width"], payload["height"]) == (mapping["frame"]["width"], mapping["frame"]["height"]),
+            "commission", "Plate extent differs from its mapping frame", 500)
+    if flow == "valid-framing":
+        require(mapping["frame"]["width"] < request["width"], "commission", "Valid framing did not crop", 500)
+    result["mapping"] = mapping
+    result["statistics"] = statistics
+    if output:
+        Path(output).mkdir(parents=True, exist_ok=True)
+        for name in ("color.png", "depth.png", "object.png"):
+            (Path(output)/name).write_bytes(call("GET", "plates/"+plate["id"]+"/passes/"+name)[0])
+    corner = call("GET", "plates/"+plate["id"]+"/pick?x=0&y=0")
+    require(corner["valid_source"] is False and corner["object"] is None
+            and corner["reason"] == "outside_valid_imaging_range",
+            "commission", "Invalid pixel names a part by accident", 500)
+    result["invalid_pick"] = corner
+    if flow == "lens-calibration":
+        center_x = int(mapping["center"][0])
+        center_y = int(mapping["center"][1])
+        center = call("GET", "plates/"+plate["id"]+"/pick?x=%d&y=%d" % (center_x, center_y))
+        require(center["valid_source"] and center["object"] is not None,
+                "commission", "Valid pixel lost its source", 500)
+        call("POST", "seals/"+seal["id"]+"/exposures", {**request, "key":"again"})
+        second = call("POST", "worker/step")["plate"]
+        comparison = call("POST", "comparisons", {"left":plate["id"], "right":second["id"]})["payload"]
+        require(comparison["color_changed"] == 0 and comparison["invalid_changed"] == 0,
+                "commission", "Calibrated rendering is not deterministic", 500)
+        result["comparison"] = {"invalid_changed": comparison["invalid_changed"],
+                                "color_changed": comparison["color_changed"]}
+    else:
+        call("POST", "seals/"+seal["id"]+"/exposures", {**request, "key":"coarse", "mapping_tolerance":2})
+        second = call("POST", "worker/step")["plate"]
+        result["rejected"] = rejected("POST", "comparisons", {"left":plate["id"], "right":second["id"]}, "alignment")
+    from facetreader import validate_bundle
+    report = validate_bundle(call("GET", "plates/"+plate["id"]+"/bundle")[0])
+    require(report["valid"] and report["summary"]["invalid_pixels"] == statistics["invalid_pixels"],
+            "commission", "Offline reader cannot reproduce the mapping", 500)
+    result["offline"] = report["summary"]
+    return result
+
 
 def commission(root, flow, output=None):
     app = Application(root)
@@ -18,6 +140,8 @@ def commission(root, flow, output=None):
             require(exc.code == code, "commission", f"Expected {code}, got {exc.code}", 500)
             return exc.code
         raise Fault("commission", "Expected rejection", 500)
+    if flow in {"lens-calibration", "valid-framing", "mapping-rejection", "mapping-preview"}:
+        return _commission_mapping(app, call, rejected, flow, output)
     mesh_data = {"name":"斜翼", "vertices":[[-1,-1,0],[1,-1,0],[1,1,0],[-1,1,0],[0,0,1.2]], "faces":[[0,1,4],[1,2,4],[2,3,4],[3,0,4],[0,3,2],[0,2,1]]}
     mesh = call("POST", "meshes", mesh_data)
     pigment = call("POST", "pigments", {"name":"釉青", "color":[.12,.62,.61], "two_sided":True})

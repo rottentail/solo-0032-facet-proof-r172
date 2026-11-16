@@ -36,12 +36,16 @@ class Worker:
             for name, data in passes.items():
                 checkpoint()
                 descriptors[name] = self.blobs.put(data)
-            payload = {"format": "facet-plate-1", "seal_id": exposure["seal_id"],
+            mapping = plan["mapping"]
+            payload = {"format": "facet-plate-2" if mapping["active"] else "facet-plate-1",
+                       "seal_id": exposure["seal_id"],
                        "seal_hash": seal["content_hash"], "request": exposure["request"],
-                       "width": exposure["request"]["width"], "height": exposure["request"]["height"],
+                       "width": plan["frame"]["width"], "height": plan["frame"]["height"],
                        "lens_hash": plan["lens_hash"], "objects": plan["objects"],
                        "passes": descriptors, "statistics": statistics,
                        "visual_hash": digest(descriptors)}
+            if mapping["active"]:
+                payload["mapping"] = mapping
             self.exposures.heartbeat(exposure["id"], exposure["token"])
             plate = self.plates.finish(exposure, payload)
             return {"state": "succeeded", "exposure_id": exposure["id"], "plate": plate}

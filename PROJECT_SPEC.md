@@ -8,7 +8,11 @@
 
 ## 处理与接口
 
-`meshes`、`pigments`、`assemblies`、`seals` 分别管理资源和快照；`planner`、`clipping`、`shading`、`raster`、`passes` 和 `png` 实现裁剪、光照、透视深度、超采样及编码。`exposures`、`worker`、`plates`、`comparison`、`proofs`、`bundles` 负责状态流转、图版和交付；`database` 与 `blobs` 提供 SQLite 事务和内容寻址持久化，`routing` 和 `server` 暴露 HTTP 入口。输入和输出及执行方式见 README。
+`meshes`、`pigments`、`assemblies`、`seals` 分别管理资源和快照；`planner`、`clipping`、`shading`、`raster`、`passes` 和 `png` 实现裁剪、光照、透视深度、超采样及编码。`camera` 与 `mapping` 负责镜头标定：偏移主点、径向畸变、有效成像范围分析、取景与有界三角剖分；`preview` 提供不落盘的同步标定预览。`exposures`、`worker`、`plates`、`comparison`、`proofs`、`bundles` 负责状态流转、图版和交付；`database` 与 `blobs` 提供 SQLite 事务和内容寻址持久化，`routing` 和 `server` 暴露 HTTP 入口。输入和输出及执行方式见 README。
+
+## 标定映射与有效范围
+
+标定镜头把径向畸变和偏移主点冻结进快照，画质容差冻结进曝光请求；二者共同决定映射，并进入图版 `mapping` 报告与分块指纹。服务从冻结镜头确定性地推导有效成像圆盘：圆盘外像素没有唯一来源方向，使用保留身份、正无穷深度和保留填充色，不计入覆盖统计，拾取不为其指认零件。取景范围由用户显式选择（保留全画布或裁到有效区域），有效范围为空时在提交曝光前以可解释的原因拒绝。畸变曲线用自适应三角剖分逼近，误差由请求声明的容差界定，剖分深度与计划三角形总数都有硬上限，超出以可解释的原因失败，不得以缩小有效范围或减弱畸变换取响应。预览接口同步且有界，只声明自己实际采用的近似画质，不产生图版事实。标定图版使用 `facet-plate-2` 并携带映射报告；比较要求两侧映射一致；独立读取器重新推导映射并核对报告。传统对称镜头继续产出 `facet-plate-1`，渲染结果不变。
 
 ## 持久进度与资源承诺
 
